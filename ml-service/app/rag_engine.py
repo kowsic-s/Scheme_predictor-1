@@ -299,26 +299,34 @@ def retrieve_relevant_context(query: str, scheme_id_context: int = None, limit: 
     
     if CHROMA_AVAILABLE:
         try:
-            where_clause = {}
+            where_clause = None
             if scheme_id_context is not None:
                 where_clause = {"scheme_id": int(scheme_id_context)}
-                
-            query_results = collection.query(
-                query_texts=[query],
-                n_results=limit,
-                where=where_clause if where_clause else None
+
+            # Use persisted documents directly so RAG remains available offline.
+            # Chroma's default embedding function downloads a model on first query.
+            stored = collection.get(
+                where=where_clause,
+                include=["documents", "metadatas"]
             )
-            
-            if query_results and 'documents' in query_results and len(query_results['documents']) > 0:
-                for idx, doc in enumerate(query_results['documents'][0]):
-                    metadata = query_results['metadatas'][0][idx]
-                    results.append({
-                        "text": doc,
-                        "scheme_name": metadata.get("scheme_name", "Unknown"),
-                        "chunk_type": metadata.get("chunk_type", "Overview")
-                    })
+            query_clean = q_lower.replace("?", "").replace(".", "").replace(",", "").replace("!", "")
+            query_words = [word for word in query_clean.split() if word not in STOP_WORDS and len(word) > 1]
+            matches = []
+            for doc, metadata in zip(stored.get("documents", []), stored.get("metadatas", [])):
+                text = (doc or "").lower()
+                score = sum(1 for word in query_words if word in text)
+                if score > 0:
+                    matches.append((score, doc, metadata or {}))
+
+            matches.sort(key=lambda item: item[0], reverse=True)
+            for _, doc, metadata in matches[:limit]:
+                results.append({
+                    "text": doc,
+                    "scheme_name": metadata.get("scheme_name", "Unknown"),
+                    "chunk_type": metadata.get("chunk_type", "Overview")
+                })
         except Exception as e:
-            logger.error(f"ChromaDB search query failed: {e}")
+            logger.error(f"ChromaDB document search failed: {e}")
             
     if not results and in_memory_docs:
         # Clean query and remove common stop-words
@@ -443,7 +451,7 @@ def generate_rag_response(query: str, session_id: int, scheme_id_context: int = 
             env_model = os.getenv("GROQ_MODEL")
             if env_model:
                 candidate_models.append(env_model)
-            for m in ["llama3-8b-8192", "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]:
+            for m in ["qwen/qwen3.8-27b", "openai/gpt-oss-20b"]:
                 if m not in candidate_models:
                     candidate_models.append(m)
 
